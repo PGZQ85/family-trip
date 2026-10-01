@@ -104,18 +104,21 @@ function init(db) {
   return ready.get(key);
 }
 
+// Counts the attempt up front, in one atomic statement, so concurrent requests can't all read the
+// counter before any of them bumps it. Call clear() once the attempt turns out to be good.
 async function throttle(db, key, { tries, minutes }, nowIso, now) {
-  const row = await db.first("SELECT count, reset_at FROM throttle WHERE key = ?", key);
-  if (row && row.reset_at > nowIso && row.count >= tries) {
+  const row = await db.first(
+    `INSERT INTO throttle (key, count, reset_at) VALUES (?, 1, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       count    = CASE WHEN reset_at > ? THEN count + 1 ELSE 1 END,
+       reset_at = CASE WHEN reset_at > ? THEN reset_at ELSE excluded.reset_at END
+     RETURNING count, reset_at`,
+    key, new Date(now + minutes * 60000).toISOString(), nowIso, nowIso);
+  if (row.count > tries) {
     const wait = Math.ceil((Date.parse(row.reset_at) - now) / 60000);
     fail(429, `Too many attempts. Try again in ${wait} minute${wait === 1 ? "" : "s"}.`);
   }
-  return {
-    failed: () => (row && row.reset_at > nowIso
-      ? db.run("UPDATE throttle SET count = count + 1 WHERE key = ?", key)
-      : db.run("INSERT OR REPLACE INTO throttle (key, count, reset_at) VALUES (?, 1, ?)", key, new Date(now + minutes * 60000).toISOString())),
-    clear: () => db.run("DELETE FROM throttle WHERE key = ?", key),
-  };
+  return { clear: () => db.run("DELETE FROM throttle WHERE key = ?", key) };
 }
 
 async function startSession(db, url, memberId, nowMs) {
@@ -198,15 +201,12 @@ export async function handle(req, db, { ip = "local", now = () => Date.now() } =
       if (!trip) fail(409, "The trip hasn't been set up yet.");
       const limit = await throttle(db, `join:${ip}`, JOIN_LIMIT, nowIso, nowMs);
       const code = str(body.code, "Family code", { min: 1, max: 40 });
-      if (!safeEqual(code.toLowerCase(), trip.code.toLowerCase())) {
-        await limit.failed();
-        fail(403, "That family code isn't right. Check with the organiser.");
-      }
+      if (!safeEqual(code.toLowerCase(), trip.code.toLowerCase())) fail(403, "That family code isn't right. Check with the organiser.");
+      await limit.clear();
       if (route === "POST /api/check-code") return json({ tripName: trip.name, households: JSON.parse(trip.households) });
     }
 
     if (route === "POST /api/join") {
-      const limit = await throttle(db, `join:${ip}`, JOIN_LIMIT, nowIso, nowMs);
       const name = str(body.name, "Your name", { min: 1, max: 40 });
       const household = int(body.household, "Household", 0, 2);
       const pin = pinOf(body.pin);
@@ -222,7 +222,6 @@ export async function handle(req, db, { ip = "local", now = () => Date.now() } =
         id = (await db.run("INSERT INTO members (name, household, pin_hash, pin_salt, created_at) VALUES (?, ?, ?, ?, ?)",
           name, household, hash, salt, nowIso)).lastId;
       }
-      await limit.clear();
       await db.batch([bump]);
       return json({ ok: true }, 200, await startSession(db, url, id, nowMs));
     }
@@ -236,11 +235,7 @@ export async function handle(req, db, { ip = "local", now = () => Date.now() } =
       const m = await db.first("SELECT id, pin_hash, pin_salt FROM members WHERE name = ? AND removed = 0", name);
       // Hash even for unknown names so timing doesn't reveal who has joined.
       const hash = await hashPin(pin, m ? m.pin_salt : "unknown-member");
-      if (!m || !safeEqual(hash, m.pin_hash)) {
-        await limit.failed();
-        await daily.failed();
-        fail(401, "Name or PIN isn't right.");
-      }
+      if (!m || !safeEqual(hash, m.pin_hash)) fail(401, "Name or PIN isn't right.");
       await limit.clear();
       await daily.clear();
       return json({ ok: true }, 200, await startSession(db, url, m.id, nowMs));
