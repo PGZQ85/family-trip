@@ -1,0 +1,13 @@
+name = "family-trip"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "family-trip"
+database_id = "00000000-0000-0000-0000-000000000000" # replaced by `wrangler d1 create` output before deploying

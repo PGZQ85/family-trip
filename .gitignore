@@ -1,4 +1,5 @@
 node_modules/
-.firebase/
+.wrangler/
+data/
 *.log
-firebase-debug.log
+.dev.vars

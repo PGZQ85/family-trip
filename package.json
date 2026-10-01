@@ -1,17 +1,17 @@
 {
   "name": "family-trip",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Family holiday planner: suggest, vote, comment and plan the itinerary together",
+  "description": "Family holiday planner: suggest, vote, comment and plan the itinerary together (SQLite)",
   "scripts": {
-    "start": "npx --yes serve -l 5174 .",
-    "test": "firebase emulators:exec --only firestore --project demo-family-trip \"node --test tests/rules.test.js\"",
-    "deploy:rules": "firebase deploy --only firestore:rules"
+    "start": "node src/server.js",
+    "test": "node --test tests/api.test.js",
+    "dev:cloudflare": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
+  "engines": { "node": ">=22.13" },
   "devDependencies": {
-    "@firebase/rules-unit-testing": "^5.0.0",
-    "firebase": "^12.19.0",
-    "firebase-tools": "^15.32.1"
+    "wrangler": "^4.145.0"
   }
 }
