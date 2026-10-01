@@ -76,6 +76,23 @@ test("sign in with name + PIN; wrong PINs lock the name for a while", async () =
   await thief.post("/api/logout");
 });
 
+test("concurrent wrong PINs and family codes are all counted", async () => {
+  const burst = (n, req) => Promise.all(Array.from({ length: n }, (_, i) => req(i)));
+  const statuses = (rs) => rs.map((r) => r.status).sort();
+
+  const thief = client("7.7.7.7");
+  const logins = await burst(8, (i) => thief.post("/api/login", { name: "Bob", pin: `100${i}` }));
+  assert.deepEqual(statuses(logins), [401, 401, 401, 401, 401, 429, 429, 429], "only 5 guesses get checked");
+  assert.equal((await thief.post("/api/login", { name: "Bob", pin: "2468" })).status, 429, "still locked");
+  clock += 16 * 60000;
+
+  const guesser = client("8.8.8.8");
+  const codes = await burst(14, (i) => guesser.post("/api/check-code", { code: `guess-${i}` }));
+  assert.deepEqual(statuses(codes), [...Array(10).fill(403), ...Array(4).fill(429)]);
+  assert.equal((await guesser.post("/api/check-code", { code: setup.code })).status, 429);
+  clock += 31 * 60000;
+});
+
 let safari;
 test("members suggest ideas (auto-liked); input is validated", async () => {
   const r = await alice.post("/api/ideas", { title: "Night Safari", category: "attraction", place: "Mandai", cost: "$55", notes: "After dinner" });
