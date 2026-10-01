@@ -42,6 +42,8 @@ test("first person sets up the trip and is signed in as organiser; it can't be s
 });
 
 test("joining needs the family code; names are unique", async () => {
+  assert.equal((await bob.post("/api/check-code", { code: "nope" })).status, 403);
+  assert.deepEqual((await bob.post("/api/check-code", { code: setup.code })).body, { tripName: "Tan Family Holiday", households: ["Tan", "Lim", "Wong"] });
   assert.equal((await bob.post("/api/join", { code: "wrong", name: "Bob", household: 1, pin: "2468" })).status, 403);
   assert.equal((await bob.post("/api/join", { code: "MANGO-OTTER-4821", name: "Bob", household: 1, pin: "2468" })).status, 200);
   const s = (await bob.get("/api/state")).body;

@@ -193,7 +193,8 @@ export async function handle(req, db, { ip = "local", now = () => Date.now() } =
       return json({ ok: true }, 200, await startSession(db, url, r.lastId, nowMs));
     }
 
-    if (route === "POST /api/join") {
+    // Step 1 of joining: check the code, then show the household names (hidden from anyone without the code).
+    if (route === "POST /api/check-code" || route === "POST /api/join") {
       if (!trip) fail(409, "The trip hasn't been set up yet.");
       const limit = await throttle(db, `join:${ip}`, JOIN_LIMIT, nowIso, nowMs);
       const code = str(body.code, "Family code", { min: 1, max: 40 });
@@ -201,6 +202,11 @@ export async function handle(req, db, { ip = "local", now = () => Date.now() } =
         await limit.failed();
         fail(403, "That family code isn't right. Check with the organiser.");
       }
+      if (route === "POST /api/check-code") return json({ tripName: trip.name, households: JSON.parse(trip.households) });
+    }
+
+    if (route === "POST /api/join") {
+      const limit = await throttle(db, `join:${ip}`, JOIN_LIMIT, nowIso, nowMs);
       const name = str(body.name, "Your name", { min: 1, max: 40 });
       const household = int(body.household, "Household", 0, 2);
       const pin = pinOf(body.pin);

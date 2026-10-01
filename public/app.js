@@ -1,15 +1,4 @@
-import { firebaseConfig } from "./firebase-config.js";
-import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
-import {
-  getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut,
-  connectAuthEmulator, signInWithCredential,
-} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
-import {
-  getFirestore, connectFirestoreEmulator, doc, getDoc, setDoc, deleteDoc, addDoc, collection, collectionGroup,
-  onSnapshot, writeBatch, serverTimestamp,
-} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
-
-// ---------- constants ----------
+// Family Trip Planner front end. Talks to the JSON API in src/api.js and polls for changes.
 
 const CATEGORIES = {
   attraction: "🎡 Attraction", activity: "🏄 Activity", food: "🍜 Food", shopping: "🛍️ Shopping",
@@ -17,7 +6,9 @@ const CATEGORIES = {
 };
 const STATUSES = { idea: "Idea", shortlist: "Shortlisted", booked: "Booked", dropped: "Dropped" };
 const SLOTS = { "": "Any time", morning: "Morning", afternoon: "Afternoon", evening: "Evening" };
+const SLOT_ORDER = ["", "morning", "afternoon", "evening"];
 const FIELD_LABELS = { title: "title", category: "type", notes: "details", place: "place", link: "link", cost: "cost", status: "status", day: "day", slot: "time" };
+const POLL_MS = 4000;
 
 // ---------- helpers ----------
 
@@ -27,13 +18,13 @@ const safeUrl = (u) => (/^https?:\/\//i.test(u || "") ? u : "");
 const options = (map, selected) => Object.entries(map).map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(selected) ? " selected" : ""}>${esc(l)}</option>`).join("");
 const initials = (name) => (name || "?").split(/\s+/).map((p) => p[0]).slice(0, 2).join("").toUpperCase();
 
-function ago(ts) {
-  if (!ts || !ts.toDate) return "just now";
-  const s = (Date.now() - ts.toDate().getTime()) / 1000;
+function ago(iso) {
+  if (!iso) return "";
+  const s = (Date.now() - Date.parse(iso)) / 1000;
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
   if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
-  return ts.toDate().toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }
 
 function dayDate(n) {
@@ -42,7 +33,6 @@ function dayDate(n) {
   d.setDate(d.getDate() + n - 1);
   return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
 }
-const dayLabel = (n) => (n ? `Day ${n}` : "Not scheduled");
 function dayOptions(selected) {
   const days = { 0: "Not scheduled" };
   for (let i = 1; i <= (state.trip?.days || 10); i++) days[i] = `Day ${i}${dayDate(i) ? " · " + dayDate(i) : ""}`;
@@ -50,131 +40,207 @@ function dayOptions(selected) {
 }
 
 function randomCode() {
-  const words = ["beach", "mango", "panda", "sunny", "island", "durian", "lantern", "kite", "coconut", "otter"];
-  const w = words[Math.floor(Math.random() * words.length)];
-  return `${w}-${Math.floor(1000 + Math.random() * 9000)}`;
+  const words = ["beach", "mango", "panda", "sunny", "island", "durian", "lantern", "kite", "coconut", "otter", "pebble", "lychee"];
+  const pick = () => words[Math.floor(Math.random() * words.length)];
+  return `${pick()}-${pick()}-${Math.floor(1000 + Math.random() * 9000)}`;
 }
 
+const memberOf = (id) => state.members.get(Number(id));
+const memberName = (id) => memberOf(id)?.name || "Someone";
 function avatar(m) {
-  if (m?.photo) return `<img class="avatar" src="${esc(m.photo)}" alt="" referrerpolicy="no-referrer">`;
   return `<span class="avatar" style="background:var(--h${m?.household ?? 0})">${esc(initials(m?.name))}</span>`;
 }
-const memberName = (uid, fallback) => state.members.get(uid)?.name || fallback || "Someone";
-const hhDot = (uid) => {
-  const m = state.members.get(uid);
+function hhDot(id) {
+  const m = memberOf(id);
   return m ? `<span class="hh hh-${m.household}" title="${esc(state.trip.households[m.household])}"></span>` : "";
-};
-
-// ---------- firebase ----------
-
-// Local testing: http://localhost:5174/?emu=alice runs against the Firebase emulators as a fake user "alice".
-const emu = ["localhost", "127.0.0.1"].includes(location.hostname) ? new URLSearchParams(location.search).get("emu") : null;
-const configured = emu || !String(firebaseConfig.apiKey).startsWith("PASTE");
-let auth, db;
-if (configured) {
-  const app = initializeApp(emu ? { apiKey: "demo", projectId: "demo-family-trip", authDomain: "localhost" } : firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
-  if (emu) {
-    connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
-    connectFirestoreEmulator(db, "127.0.0.1", 8080);
-    const name = emu[0].toUpperCase() + emu.slice(1);
-    // The auth emulator accepts an unsigned JSON "ID token".
-    signInWithCredential(auth, GoogleAuthProvider.credential(JSON.stringify({ sub: emu, email: `${emu}@example.com`, email_verified: true, name })));
-  }
 }
+
+// ---------- API ----------
+
+class ApiError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    credentials: "same-origin",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 401 && state.me) { stopPolling(); state.me = null; boot(); }
+    throw new ApiError(res.status, data.error || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+// ---------- state ----------
 
 const state = {
-  user: null, trip: null, me: null,
-  members: new Map(), ideas: new Map(), votes: new Map(), comments: new Map(), history: new Map(),
-  view: localStorage.getItem("view") || "ideas",
+  trip: null, me: null, version: 0,
+  members: new Map(), ideas: new Map(),
+  view: (() => { try { return localStorage.getItem("view") || "ideas"; } catch { return "ideas"; } })(),
   filter: { q: "", category: "", status: "active", sort: "top" },
-  openIdea: null, unsub: [],
+  openIdea: null, timer: null,
 };
 
-// ---------- auth + onboarding ----------
-
-if (!configured) {
-  renderNotConfigured();
-} else {
-  onAuthStateChanged(auth, async (user) => {
-    state.unsub.forEach((u) => u());
-    state.unsub = [];
-    state.user = user;
-    renderMe();
-    if (!user) return renderSignIn();
-    try {
-      const tripSnap = await getDoc(doc(db, "config/trip"));
-      if (!tripSnap.exists()) return renderSetup();
-      state.trip = tripSnap.data();
-      renderHeader();
-      const meSnap = await getDoc(doc(db, "members", user.uid));
-      if (!meSnap.exists()) return renderJoin();
-      startApp();
-    } catch (e) {
-      console.error(e);
-      main(`<div class="panel"><h2>Something went wrong</h2><p>${esc(e.message)}</p></div>`);
-    }
-  });
+async function load() {
+  const s = await api("GET", "/api/state");
+  state.version = s.version;
+  state.trip = s.trip;
+  state.me = s.me;
+  state.members = new Map(s.members.map((m) => [m.id, m]));
+  state.ideas = new Map(s.ideas.map((i) => [i.id, i]));
+  renderHeader();
+  renderMe();
+  render();
 }
+
+function startPolling() {
+  stopPolling();
+  state.timer = setInterval(async () => {
+    if (document.hidden || !state.me) return;
+    try {
+      const { version } = await api("GET", "/api/version");
+      if (version !== state.version) await load();
+    } catch { /* offline for a moment: try again next tick */ }
+  }, POLL_MS);
+}
+function stopPolling() { clearInterval(state.timer); state.timer = null; }
+document.addEventListener("visibilitychange", () => { if (!document.hidden && state.me) load().catch(() => {}); });
+
+// Run a change, then refresh from the server.
+async function mutate(fn) {
+  try { await fn(); }
+  catch (e) { alert(e.message); }
+  finally { if (state.me) await load().catch(() => {}); }
+}
+
+// ---------- boot + sign in ----------
 
 function main(html) { $("#main").innerHTML = html; }
 
-function renderNotConfigured() {
-  main(`<div class="panel">
-    <h2>Almost there</h2>
-    <p class="lead">This app needs a free Firebase project for sign-in and the shared database.</p>
-    <p>Follow the steps in <b>SETUP.md</b> in the repository, then paste your web config into <code>firebase-config.js</code>.</p>
-  </div>`);
+async function boot() {
+  $("#tabs").hidden = true;
+  renderMe();
+  try {
+    const s = await api("GET", "/api/session");
+    if (!s.setup) return renderSetup();
+    if (!s.signedIn) return renderSignIn();
+    await load();
+    $("#tabs").hidden = false;
+    startPolling();
+  } catch (e) {
+    main(`<div class="panel"><h2>Can't reach the server</h2><p>${esc(e.message)}</p><button class="btn" onclick="location.reload()">Try again</button></div>`);
+  }
 }
 
 function renderMe() {
-  const u = state.user;
-  $("#me").innerHTML = u
-    ? `${state.me ? avatar(state.me) : ""}<span class="name">${esc(state.me?.name || u.displayName || u.email)}</span>
-       <button class="btn small" id="signout">Sign out</button>`
+  $("#me").innerHTML = state.me
+    ? `${avatar(state.me)}<span class="name">${esc(state.me.name)}</span><button class="btn small" id="signout">Sign out</button>`
     : "";
   const so = $("#signout");
-  if (so) so.onclick = () => signOut(auth);
+  if (so) so.onclick = async () => { stopPolling(); await api("POST", "/api/logout", {}).catch(() => {}); state.me = null; boot(); };
 }
 
 function renderHeader() {
   const t = state.trip;
   $("#trip-name").textContent = t?.name || "Family Trip Planner";
   document.title = t?.name ? `${t.name} · Trip Planner` : "Family Trip Planner";
-  if (t?.startDate) {
-    const end = new Date(t.startDate + "T00:00:00");
+  if (!t) { $("#trip-dates").textContent = ""; return; }
+  if (t.startDate) {
+    const start = new Date(t.startDate + "T00:00:00"), end = new Date(start);
     end.setDate(end.getDate() + t.days - 1);
     const f = (d) => d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-    $("#trip-dates").textContent = `${t.days} days · ${f(new Date(t.startDate + "T00:00:00"))} – ${f(end)}`;
-  } else $("#trip-dates").textContent = t ? `${t.days} days` : "";
+    $("#trip-dates").textContent = `${t.days} days · ${f(start)} – ${f(end)}`;
+  } else $("#trip-dates").textContent = `${t.days} days`;
+}
+
+function formError(form, msg) { $(".form-error", form).textContent = msg; }
+async function submitting(form, fn) {
+  const btn = form.querySelector("button[type=submit]");
+  btn.disabled = true;
+  formError(form, "");
+  try { await fn(); }
+  catch (e) { formError(form, e.message); }
+  finally { btn.disabled = false; }
 }
 
 function renderSignIn() {
-  $("#tabs").hidden = true;
-  main(`<div class="panel">
-    <h2>Welcome 👋</h2>
-    <p class="lead">Suggest places to visit and things to do, vote on everyone's ideas and plan the days together.</p>
-    <button class="btn primary" id="google">Sign in with Google</button>
-    <p class="form-error" id="signin-error"></p>
-  </div>`);
-  $("#google").onclick = async () => {
-    const provider = new GoogleAuthProvider();
-    provider.setCustomParameters({ prompt: "select_account" });
-    try { await signInWithPopup(auth, provider); }
-    catch (e) {
-      if (e.code === "auth/popup-blocked" || e.code === "auth/operation-not-supported-in-this-environment") return signInWithRedirect(auth, provider);
-      if (e.code !== "auth/popup-closed-by-user") $("#signin-error").textContent = e.message;
-    }
+  state.trip = null;
+  renderHeader();
+  main(`<form class="panel" id="signin">
+    <h2>Welcome back 👋</h2>
+    <p class="lead">Sign in with your name and PIN.</p>
+    <label>Your name <input name="name" required maxlength="40" autocomplete="username"></label>
+    <label>PIN <input name="pin" type="password" required maxlength="32" inputmode="numeric" autocomplete="current-password"></label>
+    <p class="form-error"></p>
+    <button class="btn primary" type="submit">Sign in</button>
+    <p class="muted" style="margin-top:16px">New here? <button type="button" class="linklike" id="to-join">Join with the family code</button></p>
+    <p class="muted" style="font-size:13px">Forgot your PIN? Ask the trip organiser to reset it.</p>
+  </form>`);
+  const f = $("#signin");
+  $("#to-join").onclick = renderJoinCode;
+  f.onsubmit = (e) => {
+    e.preventDefault();
+    submitting(f, async () => { await api("POST", "/api/login", { name: f.name.value, pin: f.pin.value }); await boot(); });
   };
+  f.name.focus();
+}
+
+function renderJoinCode() {
+  main(`<form class="panel" id="join-code">
+    <h2>Join the family trip</h2>
+    <p>Enter the family code the organiser sent you.</p>
+    <label>Family code <input name="code" required maxlength="40" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+    <p class="form-error"></p>
+    <button class="btn primary" type="submit">Next</button>
+    <p class="muted" style="margin-top:16px">Already joined? <button type="button" class="linklike" id="to-signin">Sign in</button></p>
+  </form>`);
+  const f = $("#join-code");
+  $("#to-signin").onclick = renderSignIn;
+  f.onsubmit = (e) => {
+    e.preventDefault();
+    submitting(f, async () => {
+      const code = f.code.value.trim();
+      const info = await api("POST", "/api/check-code", { code });
+      renderJoin(code, info);
+    });
+  };
+  f.code.focus();
+}
+
+function renderJoin(code, info) {
+  main(`<form class="panel" id="join">
+    <h2>Join “${esc(info.tripName)}”</h2>
+    <label>Your name <input name="name" required maxlength="40" autocomplete="username" placeholder="What the family calls you"></label>
+    <label>Your household <select name="household">${info.households.map((n, i) => `<option value="${i}">${esc(n)}</option>`).join("")}</select></label>
+    <div class="row">
+      <label>Choose a PIN <input name="pin" type="password" required minlength="4" maxlength="32" inputmode="numeric" autocomplete="new-password"></label>
+      <label>Repeat PIN <input name="pin2" type="password" required minlength="4" maxlength="32" inputmode="numeric" autocomplete="new-password"></label>
+    </div>
+    <p class="muted" style="font-size:13px">At least 4 characters. You'll use your name and PIN to sign in on any device.</p>
+    <p class="form-error"></p>
+    <button class="btn primary" type="submit">Join the trip</button>
+  </form>`);
+  const f = $("#join");
+  f.onsubmit = (e) => {
+    e.preventDefault();
+    if (f.pin.value !== f.pin2.value) return formError(f, "The two PINs don't match.");
+    submitting(f, async () => {
+      await api("POST", "/api/join", { code, name: f.name.value, household: Number(f.household.value), pin: f.pin.value });
+      await boot();
+    });
+  };
+  f.name.focus();
 }
 
 function renderSetup() {
-  const u = state.user;
   main(`<form class="panel" id="setup">
     <h2>Set up your family trip</h2>
     <p>You're the first one here, so you'll be the trip organiser. Everyone else joins with the family code below.</p>
-    <label>Trip name <input name="name" required maxlength="80" value="Family Holiday"></label>
+    <label>Trip name <input name="tripName" required maxlength="80" value="Family Holiday"></label>
     <div class="row">
       <label>First day <input name="startDate" type="date"></label>
       <label>Number of days <input name="days" type="number" min="1" max="30" value="10" required></label>
@@ -188,146 +254,31 @@ function renderSetup() {
     <br>
     <label>Family code (share this with the family) <input name="code" required minlength="6" maxlength="40" value="${esc(randomCode())}"></label>
     <div class="row">
-      <label>Your name <input name="me" required maxlength="40" value="${esc(u.displayName || "")}"></label>
+      <label>Your name <input name="name" required maxlength="40" autocomplete="username"></label>
       <label>Your household <select name="household"><option value="0">Household 1</option><option value="1">Household 2</option><option value="2">Household 3</option></select></label>
     </div>
-    <p class="form-error" id="setup-error"></p>
+    <div class="row">
+      <label>Your PIN <input name="pin" type="password" required minlength="4" maxlength="32" inputmode="numeric" autocomplete="new-password"></label>
+      <label>Repeat PIN <input name="pin2" type="password" required minlength="4" maxlength="32" inputmode="numeric" autocomplete="new-password"></label>
+    </div>
+    <p class="form-error"></p>
     <button class="btn primary" type="submit">Create trip</button>
   </form>`);
   const f = $("#setup");
-  // Keep the household picker in sync with the names typed above.
   const syncNames = () => [0, 1, 2].forEach((i) => { f.household.options[i].textContent = f[`h${i}`].value || `Household ${i + 1}`; });
   ["h0", "h1", "h2"].forEach((n) => f[n].addEventListener("input", syncNames));
-  f.onsubmit = async (e) => {
+  f.onsubmit = (e) => {
     e.preventDefault();
-    const btn = f.querySelector("button[type=submit]");
-    btn.disabled = true;
-    const code = f.code.value.trim();
-    const trip = {
-      name: f.name.value.trim(), startDate: f.startDate.value || "", days: Math.min(30, Math.max(1, parseInt(f.days.value, 10) || 10)),
-      households: [f.h0.value.trim(), f.h1.value.trim(), f.h2.value.trim()],
-    };
-    const batch = writeBatch(db);
-    batch.set(doc(db, "config/secret"), { code, owner: u.uid });
-    batch.set(doc(db, "config/trip"), trip);
-    batch.set(doc(db, "members", u.uid), memberDoc(f.me.value, f.household.value, code));
-    try {
-      await batch.commit();
-      state.trip = trip;
-      renderHeader();
-      startApp();
-    } catch (err) {
-      console.error(err);
-      $("#setup-error").textContent = err.code === "permission-denied"
-        ? "Someone has already set up this trip — reload the page to join it."
-        : err.message;
-      btn.disabled = false;
-    }
+    if (f.pin.value !== f.pin2.value) return formError(f, "The two PINs don't match.");
+    submitting(f, async () => {
+      await api("POST", "/api/setup", {
+        tripName: f.tripName.value, startDate: f.startDate.value, days: Number(f.days.value),
+        households: [f.h0.value, f.h1.value, f.h2.value], code: f.code.value,
+        name: f.name.value, household: Number(f.household.value), pin: f.pin.value,
+      });
+      await boot();
+    });
   };
-}
-
-function memberDoc(name, household, code) {
-  const u = state.user;
-  return {
-    name: name.trim().slice(0, 40), household: parseInt(household, 10), code,
-    email: u.email || "", photo: u.photoURL || "", joinedAt: serverTimestamp(),
-  };
-}
-
-function renderJoin() {
-  $("#tabs").hidden = true;
-  const h = state.trip.households;
-  main(`<form class="panel" id="join">
-    <h2>Join “${esc(state.trip.name)}”</h2>
-    <p>Ask the trip organiser for the family code.</p>
-    <label>Family code <input name="code" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
-    <div class="row">
-      <label>Your name <input name="me" required maxlength="40" value="${esc(state.user.displayName || "")}"></label>
-      <label>Household <select name="household">${h.map((n, i) => `<option value="${i}">${esc(n)}</option>`).join("")}</select></label>
-    </div>
-    <p class="form-error" id="join-error"></p>
-    <button class="btn primary" type="submit">Join the trip</button>
-  </form>`);
-  const f = $("#join");
-  f.onsubmit = async (e) => {
-    e.preventDefault();
-    const btn = f.querySelector("button[type=submit]");
-    btn.disabled = true;
-    try {
-      await setDoc(doc(db, "members", state.user.uid), memberDoc(f.me.value, f.household.value, f.code.value.trim()));
-      startApp();
-    } catch (err) {
-      $("#join-error").textContent = err.code === "permission-denied" ? "That family code isn't right — check with the organiser." : err.message;
-      btn.disabled = false;
-    }
-  };
-}
-
-// ---------- live data ----------
-
-function startApp() {
-  $("#tabs").hidden = false;
-  main(`<p class="loading">Loading ideas…</p>`);
-  const u = state.user.uid;
-  const loaded = new Set();
-  const ready = (k) => { loaded.add(k); if (loaded.size >= 3) render(); };
-
-  state.unsub.push(onSnapshot(doc(db, "config/trip"), (s) => { state.trip = s.data(); renderHeader(); render(); }));
-  state.unsub.push(onSnapshot(collection(db, "members"), (s) => {
-    state.members = new Map(s.docs.map((d) => [d.id, d.data()]));
-    state.me = state.members.get(u) || null;
-    if (!state.me && loaded.has("members")) { location.reload(); return; } // removed by the organiser
-    renderMe();
-    ready("members"); render();
-  }, onError));
-  state.unsub.push(onSnapshot(collection(db, "ideas"), (s) => {
-    state.ideas = new Map(s.docs.map((d) => [d.id, { id: d.id, ...d.data() }]));
-    ready("ideas"); render();
-  }, onError));
-  state.unsub.push(onSnapshot(collectionGroup(db, "votes"), (s) => {
-    state.votes = new Map();
-    for (const d of s.docs) {
-      const id = d.ref.parent.parent.id;
-      if (!state.votes.has(id)) state.votes.set(id, new Map());
-      state.votes.get(id).set(d.id, d.data().value);
-    }
-    ready("votes"); render();
-  }, onError));
-  state.unsub.push(onSnapshot(collectionGroup(db, "comments"), (s) => {
-    state.comments = groupByIdea(s.docs);
-    render();
-  }, onError));
-  state.unsub.push(onSnapshot(collectionGroup(db, "history"), (s) => {
-    state.history = groupByIdea(s.docs);
-    if (state.openIdea) renderDetail();
-  }, onError));
-  state.unsub.push(() => { loaded.clear(); });
-  isOwnerCheck();
-}
-
-function groupByIdea(docs) {
-  const m = new Map();
-  for (const d of docs) {
-    const id = d.ref.parent.parent.id;
-    if (!m.has(id)) m.set(id, []);
-    m.get(id).push({ id: d.id, ...d.data() });
-  }
-  for (const list of m.values()) list.sort((a, b) => (a.at?.toMillis?.() ?? Infinity) - (b.at?.toMillis?.() ?? Infinity));
-  return m;
-}
-
-function onError(e) {
-  console.error(e);
-  if (e.code === "permission-denied") main(`<div class="panel"><h2>No access</h2><p>You're not a member of this trip (or were removed). Reload to join again.</p></div>`);
-}
-
-async function isOwnerCheck() {
-  // Only the owner may read config/secret, so a successful read means "I'm the organiser".
-  try {
-    const s = await getDoc(doc(db, "config/secret"));
-    state.owner = s.exists() ? s.data() : null;
-  } catch { state.owner = null; }
-  render();
 }
 
 // ---------- rendering ----------
@@ -340,21 +291,18 @@ function render() {
     renderQueued = false;
     if (!state.me || !state.trip) return;
     document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.view === state.view));
-    // Ideas re-renders only its list (keeps the search box); the Family forms are left alone while being edited.
+    // Ideas re-renders only its list (keeps the search box); other tabs are left alone while a field is being edited.
     const editing = $("#main").contains(document.activeElement) && document.activeElement.matches("input, select, textarea");
     if (state.view === "ideas") renderIdeas();
-    else if (state.view === "family" && editing) { /* skip */ }
-    else if (state.view === "itinerary") renderItinerary();
-    else renderFamily();
+    else if (!editing) state.view === "itinerary" ? renderItinerary() : renderFamily();
     if (state.openIdea) renderDetail();
   });
 }
 
-function tally(id) {
-  const v = state.votes.get(id) || new Map();
+function tally(idea) {
   let up = 0, down = 0;
-  for (const x of v.values()) x > 0 ? up++ : down++;
-  return { up, down, score: up - down, mine: v.get(state.user.uid) || 0 };
+  for (const v of Object.values(idea.votes)) v > 0 ? up++ : down++;
+  return { up, down, score: up - down, mine: idea.votes[state.me.id] || 0 };
 }
 
 function filteredIdeas() {
@@ -363,12 +311,12 @@ function filteredIdeas() {
   let list = [...state.ideas.values()].filter((i) =>
     (!category || i.category === category)
     && (status === "all" || (status === "active" ? i.status !== "dropped" : i.status === status))
-    && (!needle || `${i.title} ${i.place} ${i.notes} ${i.createdByName}`.toLowerCase().includes(needle)));
-  const t = (i) => i.createdAt?.toMillis?.() ?? Date.now();
-  if (sort === "top") list.sort((a, b) => tally(b.id).score - tally(a.id).score || tally(b.id).up - tally(a.id).up || t(b) - t(a));
+    && (!needle || `${i.title} ${i.place} ${i.notes} ${memberName(i.createdBy)}`.toLowerCase().includes(needle)));
+  const t = (i) => Date.parse(i.createdAt);
+  if (sort === "top") list.sort((a, b) => tally(b).score - tally(a).score || tally(b).up - tally(a).up || t(b) - t(a));
   else if (sort === "new") list.sort((a, b) => t(b) - t(a));
-  else if (sort === "day") list.sort((a, b) => (a.day || 99) - (b.day || 99) || ["", "morning", "afternoon", "evening"].indexOf(a.slot) - ["", "morning", "afternoon", "evening"].indexOf(b.slot));
-  else if (sort === "unvoted") list = list.filter((i) => !tally(i.id).mine);
+  else if (sort === "day") list.sort((a, b) => (a.day || 99) - (b.day || 99) || SLOT_ORDER.indexOf(a.slot) - SLOT_ORDER.indexOf(b.slot));
+  else if (sort === "unvoted") list = list.filter((i) => !tally(i).mine);
   return list;
 }
 
@@ -396,23 +344,22 @@ function renderIdeas() {
 function renderIdeaList() {
   const list = filteredIdeas();
   if (!state.ideas.size) {
-    $("#idea-list").innerHTML = `<div class="empty"><p>No ideas yet — be the first!</p><button class="btn primary" data-action="new">+ Suggest something</button></div>`;
+    $("#idea-list").innerHTML = `<div class="empty"><p>No ideas yet. Be the first!</p><button class="btn primary" data-action="new">+ Suggest something</button></div>`;
     return;
   }
   if (!list.length) { $("#idea-list").innerHTML = `<div class="empty">Nothing matches these filters.</div>`; return; }
   $("#idea-list").innerHTML = `<div class="grid">${list.map(cardHTML).join("")}</div>`;
 }
 
-function voteButtons(id) {
-  const t = tally(id);
-  return `<button class="vote up${t.mine > 0 ? " on" : ""}" data-action="vote" data-id="${esc(id)}" data-value="1" title="I like this" aria-pressed="${t.mine > 0}">👍 ${t.up}</button>
-    <button class="vote down${t.mine < 0 ? " on" : ""}" data-action="vote" data-id="${esc(id)}" data-value="-1" title="Not for me" aria-pressed="${t.mine < 0}">👎 ${t.down}</button>`;
+function voteButtons(i) {
+  const t = tally(i);
+  return `<button class="vote up${t.mine > 0 ? " on" : ""}" data-action="vote" data-id="${i.id}" data-value="1" title="I like this" aria-pressed="${t.mine > 0}">👍 ${t.up}</button>
+    <button class="vote down${t.mine < 0 ? " on" : ""}" data-action="vote" data-id="${i.id}" data-value="-1" title="Not for me" aria-pressed="${t.mine < 0}">👎 ${t.down}</button>`;
 }
 
 function cardHTML(i) {
-  const nComments = (state.comments.get(i.id) || []).length;
-  const t = tally(i.id);
-  return `<article class="card${i.status === "dropped" ? " dropped" : ""}" data-action="open" data-id="${esc(i.id)}" tabindex="0">
+  const t = tally(i);
+  return `<article class="card${i.status === "dropped" ? " dropped" : ""}" data-action="open" data-id="${i.id}" tabindex="0">
     <div class="card-top">
       <span class="pill">${esc(CATEGORIES[i.category] || i.category)}</span>
       ${i.status !== "idea" ? `<span class="pill st-${esc(i.status)}">${esc(STATUSES[i.status])}</span>` : ""}
@@ -420,10 +367,10 @@ function cardHTML(i) {
     </div>
     <h3>${esc(i.title)}</h3>
     ${i.place ? `<div class="place">📍 ${esc(i.place)}</div>` : ""}
-    <div class="by">${hhDot(i.createdBy)} ${esc(memberName(i.createdBy, i.createdByName))} · ${ago(i.createdAt)}${i.cost ? ` · ${esc(i.cost)}` : ""}</div>
+    <div class="by">${hhDot(i.createdBy)} ${esc(memberName(i.createdBy))} · ${ago(i.createdAt)}${i.cost ? ` · ${esc(i.cost)}` : ""}</div>
     <div class="card-foot">
-      ${voteButtons(i.id)}
-      <span class="count">💬 ${nComments}</span>
+      ${voteButtons(i)}
+      <span class="count">💬 ${i.comments.length}</span>
       <span class="score" title="Likes minus dislikes">${t.score > 0 ? "+" : ""}${t.score}</span>
     </div>
   </article>`;
@@ -432,20 +379,22 @@ function cardHTML(i) {
 function renderItinerary() {
   const days = state.trip.days || 10;
   const ideas = [...state.ideas.values()].filter((i) => i.status !== "dropped");
-  const item = (i) => `<button class="slot-item${i.status === "booked" ? " booked" : ""}" data-action="open" data-id="${esc(i.id)}">
-      ${i.status === "booked" ? "✅ " : ""}${esc(i.title)} <span class="muted">· ${tally(i.id).score >= 0 ? "+" : ""}${tally(i.id).score}</span></button>`;
+  const score = (i) => { const s = tally(i).score; return `${s >= 0 ? "+" : ""}${s}`; };
+  const item = (i) => `<button class="slot-item${i.status === "booked" ? " booked" : ""}" data-action="open" data-id="${i.id}">
+      ${i.status === "booked" ? "✅ " : ""}${esc(i.title)} <span class="muted">· ${score(i)}</span></button>`;
   let html = `<div class="toolbar"><p class="muted" style="margin:0">Open any idea and pick a day and time to place it here. ✅ = booked.</p></div><div class="days">`;
   for (let d = 1; d <= days; d++) {
     const today = ideas.filter((i) => i.day === d);
     html += `<section class="day-card"><h3>Day ${d} <span class="muted">${esc(dayDate(d))}</span></h3><div class="slots">`;
-    for (const [slot, label] of [["morning", "Morning"], ["afternoon", "Afternoon"], ["evening", "Evening"], ["", "Any time"]]) {
-      html += `<div class="slot"><div class="slot-name">${label}</div>${today.filter((i) => (i.slot || "") === slot).map(item).join("")}</div>`;
+    for (const slot of ["morning", "afternoon", "evening", ""]) {
+      html += `<div class="slot"><div class="slot-name">${SLOTS[slot]}</div>${today.filter((i) => i.slot === slot).map(item).join("")}</div>`;
     }
     html += `</div></section>`;
   }
   html += `</div>`;
-  const waiting = ideas.filter((i) => !i.day && i.status === "shortlist").sort((a, b) => tally(b.id).score - tally(a.id).score);
-  const popular = ideas.filter((i) => !i.day && i.status === "idea" && tally(i.id).score > 0).sort((a, b) => tally(b.id).score - tally(a.id).score);
+  const byScore = (a, b) => tally(b).score - tally(a).score;
+  const waiting = ideas.filter((i) => !i.day && i.status === "shortlist").sort(byScore);
+  const popular = ideas.filter((i) => !i.day && i.status === "idea" && tally(i).score > 0).sort(byScore);
   html += `<section class="unscheduled"><h3>Shortlisted, not on a day yet</h3>${waiting.length ? `<div class="grid">${waiting.map(cardHTML).join("")}</div>` : `<p class="muted">Nothing waiting.</p>`}</section>`;
   if (popular.length) html += `<section class="unscheduled"><h3>Popular ideas, not on a day yet</h3><div class="grid">${popular.map(cardHTML).join("")}</div></section>`;
   main(html);
@@ -453,23 +402,28 @@ function renderItinerary() {
 
 function renderFamily() {
   const h = state.trip.households;
-  const isOwner = !!state.owner;
+  const isOwner = state.me.isOwner;
+  const active = [...state.members.values()].filter((m) => !m.removed);
   const groups = h.map((name, i) => {
-    const ms = [...state.members.entries()].filter(([, m]) => m.household === i).sort((a, b) => a[1].name.localeCompare(b[1].name));
+    const ms = active.filter((m) => m.household === i).sort((a, b) => a.name.localeCompare(b.name));
     return `<section class="household"><h3><span class="hh hh-${i}"></span>${esc(name)} <span class="muted">${ms.length}</span></h3>
-      ${ms.map(([uid, m]) => `<div class="member">${avatar(m)} <span>${esc(m.name)}${uid === state.user.uid ? ' <span class="muted">(you)</span>' : ""}${uid === state.owner?.owner ? ' <span class="muted">· organiser</span>' : ""}</span>
-        ${isOwner && uid !== state.user.uid ? `<button class="btn small danger" data-action="remove-member" data-id="${esc(uid)}">Remove</button>` : ""}</div>`).join("") || '<p class="muted">No one yet</p>'}
+      ${ms.map((m) => `<div class="member">${avatar(m)} <span>${esc(m.name)}${m.id === state.me.id ? ' <span class="muted">(you)</span>' : ""}${m.isOwner ? ' <span class="muted">· organiser</span>' : ""}</span>
+        ${isOwner && m.id !== state.me.id ? `<span class="member-actions"><button class="btn small" data-action="reset-pin" data-id="${m.id}">Reset PIN</button>
+          <button class="btn small danger" data-action="remove-member" data-id="${m.id}">Remove</button></span>` : ""}</div>`).join("") || '<p class="muted">No one yet</p>'}
     </section>`;
   }).join("");
-  const counts = [...state.ideas.values()].reduce((a, i) => { a[i.createdBy] = (a[i.createdBy] || 0) + 1; return a; }, {});
+  const mine = [...state.ideas.values()].filter((i) => i.createdBy === state.me.id).length;
   const meForm = `<form class="household" id="me-form"><h3>Your details</h3>
       <label>Name <input name="name" required maxlength="40" value="${esc(state.me.name)}"></label>
       <label>Household <select name="household">${h.map((n, i) => `<option value="${i}"${i === state.me.household ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
-      <p class="muted" style="font-size:13px">You've suggested ${counts[state.user.uid] || 0} idea(s).</p>
+      <label>New PIN <span class="muted">(leave blank to keep)</span><input name="pin" type="password" minlength="4" maxlength="32" inputmode="numeric" autocomplete="new-password"></label>
+      <p class="muted" style="font-size:13px">You've suggested ${mine} idea${mine === 1 ? "" : "s"}.</p>
+      <p class="form-error"></p>
       <button class="btn primary small" type="submit">Save</button></form>`;
   const ownerBox = isOwner ? `<section class="household owner-box"><h3>Organiser settings</h3>
-      <p class="muted" style="font-size:13px">Share this code so family members can join:</p>
-      <div class="code-box">${esc(state.owner.code)}</div>
+      <p class="muted" style="font-size:13px">Send the family this link and code. They tap “Join with the family code”.</p>
+      <div class="code-box">${esc(state.trip.code)}</div>
+      <p class="muted" style="font-size:13px;text-align:center;margin-top:6px">${esc(location.origin)}</p>
       <form id="trip-form" style="margin-top:12px">
         <label>Trip name <input name="name" required maxlength="80" value="${esc(state.trip.name)}"></label>
         <div class="row">
@@ -477,30 +431,34 @@ function renderFamily() {
           <label>Days <input name="days" type="number" min="1" max="30" value="${state.trip.days}"></label>
         </div>
         ${h.map((n, i) => `<label>Household ${i + 1} <input name="h${i}" required maxlength="30" value="${esc(n)}"></label>`).join("")}
-        <label>Family code <input name="code" required minlength="6" maxlength="40" value="${esc(state.owner.code)}"></label>
-        <p class="muted" style="font-size:12px">Changing the code doesn't remove anyone — it only affects new joiners.</p>
-        <p class="form-error" id="trip-error"></p>
+        <label>Family code <input name="code" required minlength="6" maxlength="40" value="${esc(state.trip.code)}"></label>
+        <p class="muted" style="font-size:12px">Changing the code doesn't remove anyone. It only affects new joiners.</p>
+        <p class="form-error"></p>
         <button class="btn primary small" type="submit">Save trip settings</button>
       </form></section>` : "";
   main(`<div class="households">${groups}</div><div class="households" style="margin-top:12px">${meForm}${ownerBox}</div>`);
 
-  $("#me-form").onsubmit = async (e) => {
+  const mf = $("#me-form");
+  mf.onsubmit = (e) => {
     e.preventDefault();
-    const f = e.target;
-    await setDoc(doc(db, "members", state.user.uid), { ...state.me, name: f.name.value.trim(), household: parseInt(f.household.value, 10) });
-  };
-  if (isOwner) $("#trip-form").onsubmit = async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    const batch = writeBatch(db);
-    batch.set(doc(db, "config/trip"), {
-      name: f.name.value.trim(), startDate: f.startDate.value || "", days: Math.min(30, Math.max(1, parseInt(f.days.value, 10) || 10)),
-      households: [f.h0.value.trim(), f.h1.value.trim(), f.h2.value.trim()],
+    submitting(mf, async () => {
+      await api("PATCH", "/api/me", { name: mf.name.value, household: Number(mf.household.value), ...(mf.pin.value ? { pin: mf.pin.value } : {}) });
+      mf.pin.value = "";
+      await load();
+      formError(mf, "Saved ✓");
     });
-    const code = f.code.value.trim();
-    if (code !== state.owner.code) batch.set(doc(db, "config/secret"), { code, owner: state.owner.owner });
-    try { await batch.commit(); state.owner = { ...state.owner, code }; $("#trip-error").textContent = "Saved ✓"; }
-    catch (err) { $("#trip-error").textContent = err.message; }
+  };
+  const tf = $("#trip-form");
+  if (tf) tf.onsubmit = (e) => {
+    e.preventDefault();
+    submitting(tf, async () => {
+      await api("PATCH", "/api/trip", {
+        name: tf.name.value, startDate: tf.startDate.value, days: Number(tf.days.value),
+        households: [tf.h0.value, tf.h1.value, tf.h2.value], code: tf.code.value,
+      });
+      await load();
+      formError(tf, "Saved ✓");
+    });
   };
 }
 
@@ -519,51 +477,26 @@ function openForm(id = null) {
   $("#idea-form-title").textContent = id ? "Edit idea" : "Suggest something";
   form.day.innerHTML = dayOptions(i.day);
   for (const k of ["title", "category", "notes", "place", "link", "cost", "status", "slot"]) form[k].value = i[k] ?? "";
-  $("#idea-form-error").textContent = "";
+  formError(form, "");
   formDialog.showModal();
   form.title.focus();
 }
 
-form.addEventListener("submit", async (e) => {
+form.addEventListener("submit", (e) => {
   e.preventDefault();
   const v = {
-    title: form.title.value.trim(), category: form.category.value, notes: form.notes.value.trim(),
-    place: form.place.value.trim(), link: form.link.value.trim(), cost: form.cost.value.trim(),
-    status: form.status.value, day: parseInt(form.day.value, 10) || 0, slot: form.slot.value,
+    title: form.title.value, category: form.category.value, notes: form.notes.value,
+    place: form.place.value, link: form.link.value.trim(), cost: form.cost.value,
+    status: form.status.value, day: Number(form.day.value) || 0, slot: form.slot.value,
   };
-  if (!v.title) return;
-  if (v.link && !safeUrl(v.link)) { $("#idea-form-error").textContent = "Links must start with http:// or https://"; return; }
-  try {
-    if (editingId) await updateIdea(editingId, v);
-    else {
-      const ref = await addDoc(collection(db, "ideas"), {
-        ...v, createdBy: state.user.uid, createdByName: state.me.name, createdAt: serverTimestamp(),
-        updatedBy: state.user.uid, updatedByName: state.me.name, updatedAt: serverTimestamp(),
-      });
-      // Suggesting something counts as liking it.
-      await setDoc(doc(db, "ideas", ref.id, "votes", state.user.uid), { value: 1, at: serverTimestamp() });
-    }
+  if (v.link && !safeUrl(v.link)) return formError(form, "Links must start with http:// or https://");
+  submitting(form, async () => {
+    if (editingId) await api("PATCH", `/api/ideas/${editingId}`, v);
+    else await api("POST", "/api/ideas", v);
     formDialog.close();
-  } catch (err) {
-    console.error(err);
-    $("#idea-form-error").textContent = err.message;
-  }
-});
-
-// Apply changes to an idea and log what changed, in one atomic write.
-async function updateIdea(id, patch) {
-  const cur = state.ideas.get(id);
-  const changes = {};
-  for (const [k, v] of Object.entries(patch)) if (cur[k] !== v) changes[k] = [cur[k] ?? "", v];
-  if (!Object.keys(changes).length) return;
-  const { id: _omit, ...rest } = cur;
-  const batch = writeBatch(db);
-  batch.set(doc(db, "ideas", id), {
-    ...rest, ...patch, updatedBy: state.user.uid, updatedByName: state.me.name, updatedAt: serverTimestamp(),
+    await load();
   });
-  batch.set(doc(collection(db, "ideas", id, "history")), { by: state.user.uid, byName: state.me.name, at: serverTimestamp(), changes });
-  await batch.commit();
-}
+});
 
 // ---------- idea detail ----------
 
@@ -592,31 +525,31 @@ function renderDetail() {
   const i = state.ideas.get(state.openIdea);
   const box = $("#detail");
   if (!i) { detailDialog.close(); return; }
-  // Keep a half-written comment when live updates re-render the dialog.
+  // Keep a half-written comment when updates re-render the dialog.
   const draft = $("#comment-text", box)?.value || "";
   const hadFocus = document.activeElement?.id === "comment-text";
 
-  const votes = state.votes.get(i.id) || new Map();
-  const voters = (val) => [...votes.entries()].filter(([, v]) => v === val).map(([uid]) => `${hhDot(uid)} ${esc(memberName(uid))}`).join(", ") || '<span class="muted">nobody yet</span>';
-  const comments = state.comments.get(i.id) || [];
-  const history = (state.history.get(i.id) || []).slice().reverse();
-  const canDelete = i.createdBy === state.user.uid || !!state.owner;
+  const voters = (val) => Object.entries(i.votes).filter(([, v]) => v === val).map(([id]) => `${hhDot(id)} ${esc(memberName(id))}`).join(", ") || '<span class="muted">nobody yet</span>';
+  const history = i.history.slice().reverse();
+  const canDelete = i.createdBy === state.me.id || state.me.isOwner;
   const link = safeUrl(i.link);
+  let host = "";
+  try { host = link ? new URL(link).hostname : ""; } catch { /* malformed link: show nothing */ }
 
   box.innerHTML = `
     <div class="detail-head">
       <div>
         <div class="card-top"><span class="pill">${esc(CATEGORIES[i.category])}</span>${i.status !== "idea" ? `<span class="pill st-${esc(i.status)}">${esc(STATUSES[i.status])}</span>` : ""}</div>
         <h2>${esc(i.title)}</h2>
-        <div class="muted" style="font-size:13px">${hhDot(i.createdBy)} Suggested by ${esc(memberName(i.createdBy, i.createdByName))} · ${ago(i.createdAt)}
-          ${i.updatedBy && i.updatedAt && history.length ? ` · last edited by ${esc(memberName(i.updatedBy, i.updatedByName))} ${ago(i.updatedAt)}` : ""}</div>
+        <div class="muted" style="font-size:13px">${hhDot(i.createdBy)} Suggested by ${esc(memberName(i.createdBy))} · ${ago(i.createdAt)}
+          ${history.length ? ` · last edited by ${esc(memberName(i.updatedBy))} ${ago(i.updatedAt)}` : ""}</div>
       </div>
       <button class="btn small" data-close aria-label="Close">✕</button>
     </div>
     <div class="facts">
       ${i.place ? `<span>📍 ${esc(i.place)}</span>` : ""}
       ${i.cost ? `<span>💲 ${esc(i.cost)}</span>` : ""}
-      ${link ? `<a href="${esc(link)}" target="_blank" rel="noopener noreferrer">🔗 ${esc(new URL(link).hostname)}</a>` : ""}
+      ${host ? `<a href="${esc(link)}" target="_blank" rel="noopener noreferrer">🔗 ${esc(host)}</a>` : ""}
     </div>
     ${i.notes ? `<p class="notes">${esc(i.notes)}</p>` : ""}
 
@@ -626,19 +559,19 @@ function renderDetail() {
       <label>Time <select data-quick="slot">${options(SLOTS, i.slot)}</select></label>
     </div>
 
-    <div class="card-foot">${voteButtons(i.id)}
+    <div class="card-foot">${voteButtons(i)}
       <span style="margin-left:auto"></span>
-      <button class="btn small" data-action="edit" data-id="${esc(i.id)}">✏️ Edit</button>
-      ${canDelete ? `<button class="btn small danger" data-action="delete" data-id="${esc(i.id)}">Delete</button>` : ""}
+      <button class="btn small" data-action="edit" data-id="${i.id}">✏️ Edit</button>
+      ${canDelete ? `<button class="btn small danger" data-action="delete" data-id="${i.id}">Delete</button>` : ""}
     </div>
     <div class="voters" style="margin-top:8px"><span>👍 ${voters(1)}</span></div>
     <div class="voters"><span>👎 ${voters(-1)}</span></div>
 
     <section class="section">
-      <h3>Comments (${comments.length})</h3>
-      <ul class="comments">${comments.map((c) => `<li>
-        <div class="who">${hhDot(c.by)} <b>${esc(memberName(c.by, c.byName))}</b> · ${ago(c.at)}
-          ${c.by === state.user.uid || state.owner ? `<button class="linklike" data-action="delete-comment" data-id="${esc(c.id)}">delete</button>` : ""}</div>
+      <h3>Comments (${i.comments.length})</h3>
+      <ul class="comments">${i.comments.map((c) => `<li>
+        <div class="who">${hhDot(c.by)} <b>${esc(memberName(c.by))}</b> · ${ago(c.at)}
+          ${c.by === state.me.id || state.me.isOwner ? `<button class="linklike" data-action="delete-comment" data-id="${c.id}">delete</button>` : ""}</div>
         <p>${esc(c.text)}</p></li>`).join("") || '<li class="muted">No comments yet.</li>'}</ul>
       <form class="comment-form" id="comment-form">
         <textarea id="comment-text" rows="2" maxlength="1000" placeholder="Add a comment or suggest a change…" required></textarea>
@@ -647,64 +580,58 @@ function renderDetail() {
     </section>
 
     ${history.length ? `<section class="section"><h3>Changes</h3><ul class="history">${history.map((h) =>
-      `<li>${hhDot(h.by)} <b>${esc(memberName(h.by, h.byName))}</b> ${Object.entries(h.changes).map(([f, c]) => describeChange(f, c)).join("; ")} · ${ago(h.at)}</li>`).join("")}</ul></section>` : ""}
+      `<li>${hhDot(h.by)} <b>${esc(memberName(h.by))}</b> ${Object.entries(h.changes).map(([f, c]) => describeChange(f, c)).join("; ")} · ${ago(h.at)}</li>`).join("")}</ul></section>` : ""}
   `;
 
   const ta = $("#comment-text", box);
   ta.value = draft;
   if (hadFocus) { ta.focus(); ta.setSelectionRange(draft.length, draft.length); }
-  $("#comment-form", box).onsubmit = async (e) => {
+  $("#comment-form", box).onsubmit = (e) => {
     e.preventDefault();
     const text = ta.value.trim();
     if (!text) return;
     ta.value = "";
-    await addDoc(collection(db, "ideas", i.id, "comments"), { text, by: state.user.uid, byName: state.me.name, at: serverTimestamp() });
+    mutate(() => api("POST", `/api/ideas/${i.id}/comments`, { text }));
   };
   box.querySelectorAll("[data-quick]").forEach((sel) => {
     sel.onchange = () => {
       const k = sel.dataset.quick;
-      updateIdea(i.id, { [k]: k === "day" ? parseInt(sel.value, 10) || 0 : sel.value }).catch((err) => alert(err.message));
+      mutate(() => api("PATCH", `/api/ideas/${i.id}`, { [k]: k === "day" ? Number(sel.value) || 0 : sel.value }));
     };
   });
 }
 
 // ---------- actions ----------
 
-async function vote(id, value) {
-  const ref = doc(db, "ideas", id, "votes", state.user.uid);
-  if (tally(id).mine === value) await deleteDoc(ref); // tap again to undo
-  else await setDoc(ref, { value, at: serverTimestamp() });
-}
-
-document.addEventListener("click", async (e) => {
+document.addEventListener("click", (e) => {
   if (e.target.closest("[data-close]")) { e.target.closest("dialog")?.close(); return; }
   const el = e.target.closest("[data-action]");
   if (!el) return;
-  const { action, id } = el.dataset;
-  try {
-    if (action === "new") openForm();
-    else if (action === "open") openDetail(id);
-    else if (action === "vote") { e.stopPropagation(); await vote(id, parseInt(el.dataset.value, 10)); }
-    else if (action === "edit") openForm(id);
-    else if (action === "delete") {
-      if (!confirm("Delete this idea for everyone?")) return;
-      detailDialog.close();
-      await deleteDoc(doc(db, "ideas", id));
-    } else if (action === "delete-comment") {
-      if (!confirm("Delete this comment?")) return;
-      await deleteDoc(doc(db, "ideas", state.openIdea, "comments", id));
-    } else if (action === "remove-member") {
-      if (!confirm(`Remove ${memberName(id)} from the trip? They can rejoin with the family code.`)) return;
-      await deleteDoc(doc(db, "members", id));
-    }
-  } catch (err) {
-    console.error(err);
-    alert(err.message);
+  const action = el.dataset.action, id = Number(el.dataset.id);
+  if (action === "new") openForm();
+  else if (action === "open") openDetail(id);
+  else if (action === "edit") openForm(id);
+  else if (action === "vote") {
+    const value = Number(el.dataset.value);
+    mutate(() => api("PUT", `/api/ideas/${id}/vote`, { value: tally(state.ideas.get(id)).mine === value ? 0 : value })); // tap again to undo
+  } else if (action === "delete") {
+    if (!confirm("Delete this idea for everyone?")) return;
+    detailDialog.close();
+    mutate(() => api("DELETE", `/api/ideas/${id}`, {}));
+  } else if (action === "delete-comment") {
+    if (!confirm("Delete this comment?")) return;
+    mutate(() => api("DELETE", `/api/comments/${id}`, {}));
+  } else if (action === "remove-member") {
+    if (!confirm(`Remove ${memberName(id)} from the trip? They can rejoin with the family code.`)) return;
+    mutate(() => api("DELETE", `/api/members/${id}`, {}));
+  } else if (action === "reset-pin") {
+    const pin = prompt(`New PIN for ${memberName(id)} (at least 4 characters). Tell them the new PIN; they can change it later.`);
+    if (pin) mutate(async () => { await api("POST", `/api/members/${id}/pin`, { pin }); alert(`PIN for ${memberName(id)} has been reset.`); });
   }
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && e.target.matches?.(".card[data-action=open]")) openDetail(e.target.dataset.id);
+  if (e.key === "Enter" && e.target.matches?.(".card[data-action=open]")) openDetail(Number(e.target.dataset.id));
 });
 
 $("#tabs").addEventListener("click", (e) => {
@@ -715,3 +642,5 @@ $("#tabs").addEventListener("click", (e) => {
   main("");
   render();
 });
+
+boot();
