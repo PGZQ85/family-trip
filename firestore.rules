@@ -42,7 +42,7 @@ service cloud.firestore {
     }
 
     match /members/{memberId} {
-      allow read: if isMember();
+      allow read: if isMember() || (signedIn() && memberId == uid());
       allow create: if signedIn() && memberId == uid() && data().code == secretAfter().code && validMember();
       allow update: if signedIn() && memberId == uid() && data().code == resource.data.code && validMember();
       allow delete: if signedIn() && (memberId == uid() || isOwner());

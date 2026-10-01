@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Family Trip Planner</title>
+  <meta name="description" content="Suggest places and things to do for the family holiday, vote, comment and build the 10-day itinerary together.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧳</text></svg>">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">🧳</span>
+      <div>
+        <h1 id="trip-name">Family Trip Planner</h1>
+        <p id="trip-dates" class="muted"></p>
+      </div>
+    </div>
+    <div id="me" class="me"></div>
+  </header>
+
+  <nav id="tabs" class="tabs" hidden>
+    <button data-view="ideas" class="on">💡 Ideas</button>
+    <button data-view="itinerary">🗓️ 10-day plan</button>
+    <button data-view="family">👪 Family</button>
+  </nav>
+
+  <main id="main"><p class="loading">Loading…</p></main>
+
+  <!-- Suggest / edit an idea -->
+  <dialog id="idea-form-dialog">
+    <form id="idea-form" method="dialog">
+      <h2 id="idea-form-title">Suggest something</h2>
+      <label>What is it? <input name="title" required maxlength="100" placeholder="e.g. Universal Studios, night safari, chilli crab dinner"></label>
+      <div class="row">
+        <label>Type
+          <select name="category"></select>
+        </label>
+        <label>Rough cost <input name="cost" maxlength="40" placeholder="e.g. $80 / person"></label>
+      </div>
+      <label>Where <input name="place" maxlength="120" placeholder="Area or address"></label>
+      <label>Link <input name="link" type="url" maxlength="500" placeholder="https://…"></label>
+      <label>Why / details <textarea name="notes" rows="4" maxlength="2000" placeholder="Good for kids? Best time to go? Booking needed?"></textarea></label>
+      <div class="row three">
+        <label>Status <select name="status"></select></label>
+        <label>Day <select name="day"></select></label>
+        <label>Time <select name="slot"></select></label>
+      </div>
+      <p class="form-error" id="idea-form-error"></p>
+      <div class="actions">
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Idea details, votes, comments, history -->
+  <dialog id="detail-dialog" class="wide">
+    <div id="detail"></div>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
