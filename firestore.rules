@@ -1,0 +1,92 @@
+rules_version = '2';
+
+// Family Trip Planner — only people who joined with the family code can read or write.
+//
+// config/secret   { code, owner }        never readable by clients except the owner; created once
+// config/trip     { name, startDate, days, households[] }   readable by anyone signed in (join screen)
+// members/{uid}   { name, household, code, email, photo, joinedAt }
+// ideas/{id}      the suggestions; any member may edit, every edit is logged in history
+//   /votes/{uid}    { value: 1 | -1 }    one per member
+//   /comments/{id}  { text, by, byName, at }
+//   /history/{id}   { by, byName, at, changes }
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function secretAfter() { return getAfter(/databases/$(database)/documents/config/secret).data; }
+    function isMember() { return signedIn() && exists(/databases/$(database)/documents/members/$(request.auth.uid)); }
+    function isOwner() { return signedIn() && get(/databases/$(database)/documents/config/secret).data.owner == uid(); }
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function data() { return request.resource.data; }
+
+    match /config/secret {
+      allow get: if isOwner();
+      allow list: if false;
+      // First person to set up the trip becomes the owner. Creating an existing doc counts as update, so this runs once.
+      allow create: if signedIn() && data().owner == uid() && str(data().code, 6, 40)
+        && data().keys().hasOnly(["code", "owner"]);
+      allow update: if isOwner() && data().owner == resource.data.owner && str(data().code, 6, 40)
+        && data().keys().hasOnly(["code", "owner"]);
+    }
+
+    match /config/trip {
+      allow read: if signedIn();
+      allow create: if signedIn() && secretAfter().owner == uid() && validTrip();
+      allow update: if isOwner() && validTrip();
+    }
+    function validTrip() {
+      return data().keys().hasOnly(["name", "startDate", "days", "households"])
+        && str(data().name, 1, 80) && str(data().startDate, 0, 10)
+        && data().days is int && data().days >= 1 && data().days <= 30
+        && data().households is list && data().households.size() == 3;
+    }
+
+    match /members/{memberId} {
+      allow read: if isMember();
+      allow create: if signedIn() && memberId == uid() && data().code == secretAfter().code && validMember();
+      allow update: if signedIn() && memberId == uid() && data().code == resource.data.code && validMember();
+      allow delete: if signedIn() && (memberId == uid() || isOwner());
+    }
+    function validMember() {
+      return data().keys().hasOnly(["name", "household", "code", "email", "photo", "joinedAt"])
+        && str(data().name, 1, 40) && data().household is int && data().household >= 0 && data().household <= 2;
+    }
+
+    match /ideas/{ideaId} {
+      allow read: if isMember();
+      allow create: if isMember() && data().createdBy == uid() && validIdea();
+      allow update: if isMember() && data().createdBy == resource.data.createdBy
+        && data().createdAt == resource.data.createdAt && validIdea();
+      allow delete: if isMember() && (resource.data.createdBy == uid() || isOwner());
+
+      match /votes/{voterId} {
+        allow create, update: if isMember() && voterId == uid() && data().keys().hasOnly(["value", "at"])
+          && (data().value == 1 || data().value == -1);
+        allow delete: if isMember() && voterId == uid();
+      }
+      match /comments/{commentId} {
+        allow create: if isMember() && data().by == uid() && str(data().text, 1, 1000)
+          && data().keys().hasOnly(["text", "by", "byName", "at"]);
+        allow delete: if isMember() && (resource.data.by == uid() || isOwner());
+      }
+      match /history/{entryId} {
+        allow create: if isMember() && data().by == uid() && data().keys().hasOnly(["by", "byName", "at", "changes"]);
+      }
+    }
+    function validIdea() {
+      return data().keys().hasOnly(["title", "category", "notes", "place", "link", "cost", "status", "day", "slot",
+          "createdBy", "createdByName", "createdAt", "updatedBy", "updatedByName", "updatedAt"])
+        && str(data().title, 1, 100) && str(data().notes, 0, 2000) && str(data().place, 0, 120)
+        && str(data().link, 0, 500) && str(data().cost, 0, 40)
+        && data().category in ["attraction", "activity", "food", "shopping", "nature", "stay", "transport", "other"]
+        && data().status in ["idea", "shortlist", "booked", "dropped"]
+        && data().day is int && data().day >= 0 && data().day <= 30
+        && data().slot in ["", "morning", "afternoon", "evening"];
+    }
+
+    // Collection-group reads, so the app can show live vote / comment counts on every card.
+    match /{path=**}/votes/{voterId} { allow read: if isMember(); }
+    match /{path=**}/comments/{commentId} { allow read: if isMember(); }
+    match /{path=**}/history/{entryId} { allow read: if isMember(); }
+  }
+}
