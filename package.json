@@ -1,0 +1,17 @@
+{
+  "name": "family-trip",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Family holiday planner: suggest, vote, comment and plan the itinerary together",
+  "scripts": {
+    "start": "npx --yes serve -l 5174 .",
+    "test": "firebase emulators:exec --only firestore --project demo-family-trip \"node --test tests/rules.test.js\"",
+    "deploy:rules": "firebase deploy --only firestore:rules"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.0",
+    "firebase": "^12.19.0",
+    "firebase-tools": "^15.32.1"
+  }
+}

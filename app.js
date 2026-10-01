@@ -2,9 +2,10 @@ import { firebaseConfig } from "./firebase-config.js";
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
 import {
   getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut,
+  connectAuthEmulator, signInWithCredential,
 } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
 import {
-  getFirestore, doc, getDoc, setDoc, deleteDoc, addDoc, collection, collectionGroup,
+  getFirestore, connectFirestoreEmulator, doc, getDoc, setDoc, deleteDoc, addDoc, collection, collectionGroup,
   onSnapshot, writeBatch, serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
 
@@ -66,12 +67,21 @@ const hhDot = (uid) => {
 
 // ---------- firebase ----------
 
-const configured = !String(firebaseConfig.apiKey).startsWith("PASTE");
+// Local testing: http://localhost:5174/?emu=alice runs against the Firebase emulators as a fake user "alice".
+const emu = ["localhost", "127.0.0.1"].includes(location.hostname) ? new URLSearchParams(location.search).get("emu") : null;
+const configured = emu || !String(firebaseConfig.apiKey).startsWith("PASTE");
 let auth, db;
 if (configured) {
-  const app = initializeApp(firebaseConfig);
+  const app = initializeApp(emu ? { apiKey: "demo", projectId: "demo-family-trip", authDomain: "localhost" } : firebaseConfig);
   auth = getAuth(app);
   db = getFirestore(app);
+  if (emu) {
+    connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+    connectFirestoreEmulator(db, "127.0.0.1", 8080);
+    const name = emu[0].toUpperCase() + emu.slice(1);
+    // The auth emulator accepts an unsigned JSON "ID token".
+    signInWithCredential(auth, GoogleAuthProvider.credential(JSON.stringify({ sub: emu, email: `${emu}@example.com`, email_verified: true, name })));
+  }
 }
 
 const state = {
